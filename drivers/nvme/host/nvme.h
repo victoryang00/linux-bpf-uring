@@ -715,6 +715,10 @@ static inline bool nvme_try_complete_req(struct request *req, __le16 status,
 		union nvme_result result)
 {
 	struct nvme_request *rq = nvme_req(req);
+	if (req->xrp_command) {
+		kfree(req->xrp_command);
+		req->xrp_command = NULL;
+	}
 	struct nvme_ctrl *ctrl = rq->ctrl;
 
 	if (!(ctrl->quirks & NVME_QUIRK_SKIP_CID_GEN))

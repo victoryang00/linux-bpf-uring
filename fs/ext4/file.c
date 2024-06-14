@@ -957,4 +957,4 @@ const struct inode_operations ext4_file_inode_operations = {
 	.fileattr_get	= ext4_fileattr_get,
 	.fileattr_set	= ext4_fileattr_set,
 };
-
+EXPORT_SYMBOL(ext4_file_inode_operations);

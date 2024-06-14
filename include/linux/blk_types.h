@@ -263,6 +263,13 @@ struct bio {
 
 	struct bio_set		*bi_pool;
 
+	struct inode		*xrp_inode;
+	u64			xrp_partition_start_sector;
+	int			xrp_count;
+	struct page		*xrp_scratch_page;
+	// struct bpf_prog		*xrp_bpf_prog;
+	u64			xrp_extent_version;
+	loff_t			xrp_file_offset;
 	/*
 	 * We can inline a number of vecs at the end of the bio, to avoid
 	 * double allocations for a small number of bio_vecs. This member

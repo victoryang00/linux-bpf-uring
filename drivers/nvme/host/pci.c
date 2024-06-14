@@ -839,7 +839,18 @@ static blk_status_t nvme_prep_rq(struct nvme_dev *dev, struct request *req)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	blk_status_t ret;
-
+	struct nvme_command *cmndp;
+	if (req->bio && bpf_uring_enable()) {
+		cmndp = kmalloc(sizeof(struct nvme_command), GFP_NOWAIT);
+		if (!cmndp) {
+			printk("nvme_queue_rq: failed to allocate struct nvme_command\n");
+			req->xrp_command = NULL;
+		} else {
+			req->xrp_command = cmndp;
+		}
+	} else {
+		req->xrp_command = NULL;
+	}
 	iod->aborted = false;
 	iod->nr_allocations = -1;
 	iod->sgt.nents = 0;
@@ -1037,10 +1048,116 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq,
 	}
 
 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
-	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
-	    !blk_mq_add_to_batch(req, iob, nvme_req(req)->status,
-					nvme_pci_complete_batch))
-		nvme_pci_complete_rq(req);
+	if (!req->bio || !bpf_uring_enable()) {
+		if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
+		    !blk_mq_add_to_batch(req, iob, nvme_req(req)->status,
+					 nvme_pci_complete_batch))
+			nvme_pci_complete_rq(req);
+	} else {
+		/* ebpf enabled */
+		struct bpf_prog *ebpf_prog;
+		struct bpf_xrp_kern ebpf_context;
+		u32 ebpf_return;
+		loff_t file_offset, data_len;
+		u64 disk_offset;
+		ktime_t ebpf_start;
+		ktime_t resubmit_start = ktime_get();
+
+		struct xrp_mapping mapping;
+		ktime_t extent_lookup_start;
+
+		/* verify version number */
+		if (req->bio->xrp_count > 1
+		    && req->bio->xrp_inode->i_op == &ext4_file_inode_operations) {
+			file_offset = req->bio->xrp_file_offset;
+			data_len = 512;
+
+			extent_lookup_start = ktime_get();
+			xrp_retrieve_mapping(req->bio->xrp_inode, file_offset, data_len, &mapping);
+			atomic_long_add(ktime_sub(ktime_get(), extent_lookup_start), &xrp_extent_lookup_time);
+			atomic_long_inc(&xrp_extent_lookup_count);
+			if (!mapping.exist || mapping.len < data_len || mapping.address & 0x1ff) {
+				printk("nvme_handle_cqe: failed to retrieve address mapping during verification with logical address 0x%llx, dump context\n", file_offset);
+				ebpf_dump_page((uint8_t *) ebpf_context.scratch, 4096);
+				if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+					nvme_pci_complete_rq(req);
+				return;
+			} else if (mapping.version != req->bio->xrp_extent_version) {
+				printk("nvme_handle_cqe: version mismatch with logical address 0x%llx (expected %lld, got %lld), dump context\n",
+				       file_offset, req->bio->xrp_extent_version, mapping.version);
+				ebpf_dump_page((uint8_t *) ebpf_context.scratch, 4096);
+				if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+					nvme_pci_complete_rq(req);
+				return;
+			}
+		}
+
+		memset(&ebpf_context, 0, sizeof(struct bpf_xrp_kern));
+		ebpf_context.data = page_address(bio_page(req->bio));
+		ebpf_context.scratch = page_address(req->bio->xrp_scratch_page);
+		
+		ebpf_start = ktime_get();
+		// ebpf_prog = req->bio->xrp_bpf_prog;
+		ebpf_return = bpf_uring_prog(&ebpf_context, cqe, sqe);
+		if (ebpf_return == EINVAL) {
+			printk("nvme_handle_cqe: ebpf search failed\n");
+		} else if (ebpf_return != 0) {
+			printk("nvme_handle_cqe: ebpf search unknown error %d\n", ebpf_return);
+		}
+		atomic_long_add(ktime_sub(ktime_get(), ebpf_start), &xrp_ebpf_time);
+		atomic_long_inc(&xrp_ebpf_count);
+
+		if (ebpf_return != 0) {
+			/* error happens when calling ebpf function. end the request and return */
+			printk("nvme_handle_cqe: ebpf failed, dump context\n");
+			ebpf_dump_page((uint8_t *) ebpf_context.scratch, 4096);
+			if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+				nvme_pci_complete_rq(req);
+			return;
+		}
+		if (ebpf_context.done) {
+			/* finish traversal */
+			atomic_long_add(ktime_sub(ktime_get(), resubmit_start), &xrp_resubmit_leaf_time);
+			atomic_long_inc(&xrp_resubmit_leaf_count);
+			atomic_long_add(req->bio->xrp_count, &xrp_resubmit_level_nr);
+			atomic_long_inc(&xrp_resubmit_level_count);
+			if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+				nvme_pci_complete_rq(req);
+			return;
+		}
+		/* address mapping */
+		file_offset = ebpf_context.next_addr[0];
+		data_len = 512;
+		// FIXME: support variable data_len and more than one next_addr
+		req->bio->xrp_file_offset = file_offset;
+		if (req->bio->xrp_inode->i_op == &ext4_file_inode_operations) {
+			extent_lookup_start = ktime_get();
+			xrp_retrieve_mapping(req->bio->xrp_inode, file_offset, data_len, &mapping);
+			atomic_long_add(ktime_sub(ktime_get(), extent_lookup_start), &xrp_extent_lookup_time);
+			atomic_long_inc(&xrp_extent_lookup_count);
+			if (!mapping.exist || mapping.len < data_len || mapping.address & 0x1ff) {
+				printk("nvme_handle_cqe: failed to retrieve address mapping with logical address 0x%llx, dump context\n", file_offset);
+				ebpf_dump_page((uint8_t *) ebpf_context.scratch, 4096);
+				if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+					nvme_pci_complete_rq(req);
+				return;
+			} else {
+				req->bio->xrp_extent_version = mapping.version;
+				disk_offset = mapping.address;
+			}
+		} else {
+			/* no address translation, use direct map */
+			disk_offset = file_offset;
+		}
+		nvme_req(req)->cmd = req->xrp_command;
+		req->bio->xrp_count += 1;
+		req->bio->bi_iter.bi_sector = (disk_offset >> 9) + req->bio->xrp_partition_start_sector;
+		req->__sector = req->bio->bi_iter.bi_sector;
+		req->xrp_command->rw.slba = cpu_to_le64(nvme_sect_to_lba(req->q->queuedata, blk_rq_pos(req)));
+		atomic_long_add(ktime_sub(ktime_get(), resubmit_start), &xrp_resubmit_int_time);
+		atomic_long_inc(&xrp_resubmit_int_count);
+		nvme_submit_cmd(nvmeq, req->xrp_command, true);
+	}
 }
 
 static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)

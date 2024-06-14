@@ -361,6 +361,7 @@ struct readahead_control;
 
 struct kiocb {
 	struct file		*ki_filp;
+	char __user *xrp_scratch_buf;
 	loff_t			ki_pos;
 	void (*ki_complete)(struct kiocb *iocb, long ret);
 	void			*private;
@@ -626,6 +627,8 @@ is_uncached_acl(struct posix_acl *acl)
  * of the 'struct inode'
  */
 struct inode {
+	struct rb_root __rcu	*xrp_extent_root;
+	spinlock_t		xrp_extent_lock;
 	umode_t			i_mode;
 	unsigned short		i_opflags;
 	kuid_t			i_uid;
@@ -759,7 +762,36 @@ static inline void inode_fake_hash(struct inode *inode)
 {
 	hlist_add_fake(&inode->i_hash);
 }
+#define XRP_MAX_LEN	0xffffffff
+#define XRP_BLOCK_SHIFT	12
+#define XRP_BLOCK_SIZE	(1 << XRP_BLOCK_SHIFT)
 
+struct xrp_root {
+	struct rb_root rb_root;
+	__u64 version;
+	struct rcu_head rcu_head;
+};
+
+struct xrp_extent {
+	struct rb_node rb_node;
+	__u32 lblk;
+	__u32 len;
+	__u64 pblk;
+	__u64 version;
+};
+
+struct xrp_mapping {
+	bool exist;
+	loff_t offset;  /* file offset */
+	__u64 len;
+	__u64 address;  /* disk address */
+	__u64 version;
+};
+
+void xrp_sync_ext4_extent(struct inode *inode, bool lock_inode);
+void xrp_print_tree(struct inode *inode);
+void xrp_clear_tree(struct inode *inode);
+void xrp_retrieve_mapping(struct inode *inode, loff_t offset, loff_t len, struct xrp_mapping *mapping);
 /*
  * inode->i_mutex nesting subclasses for the lock validator:
  *
